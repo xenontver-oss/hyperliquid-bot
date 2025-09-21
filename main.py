@@ -30,6 +30,7 @@ API_URL = os.getenv("API_URL")
 WALLETS = os.getenv("WALLETS")
 TG_TOKEN = os.getenv("TG_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+REPORT_INTERVAL_HOURS = int(os.getenv("REPORT_INTERVAL_HOURS", "1"))
 
 # Проверка, что все переменные загружены
 missing_vars = []
@@ -793,6 +794,145 @@ def send_hourly_positions_report():
         error_msg = f"❌ Ошибка при создании часового отчета: {e}"
         print(error_msg)
         debug_logger.error(error_msg)
+
+def send_hourly_wallet_ranking_report():
+    """Отправляет часовой отчет с рейтингом кошельков по NET PnL за последние 24 часа"""
+    try:
+        print("\n🏆 Создание часового рейтингового отчета кошельков...")
+        debug_logger.info("🏆 Создание часового рейтингового отчета кошельков...")
+
+        # Временная метка 24 часа назад (в миллисекундах)
+        twenty_four_hours_ago = int((time.time() - 24 * 3600) * 1000)
+
+        wallet_results = []
+
+        for wallet in WALLETS:
+            try:
+                cursor.execute(f"""
+                    SELECT SUM(closedPnl) as total_closed_pnl, SUM(net_pnl) as total_net_pnl, COUNT(*) as trade_count
+                    FROM trades_{wallet}
+                    WHERE timestamp > ?
+                """, (twenty_four_hours_ago,))
+
+                result = cursor.fetchone()
+                if result and result[0] is not None:
+                    closed_pnl = safe_float(result[0])
+                    net_pnl = safe_float(result[1])
+                    trade_count = result[2]
+
+                    wallet_name = WALLET_NAMES.get(wallet, f"{wallet[:6]}...{wallet[-4:]}")
+
+                    wallet_results.append({
+                        'wallet': wallet,
+                        'wallet_name': wallet_name,
+                        'closed_pnl': closed_pnl,
+                        'net_pnl': net_pnl,
+                        'trade_count': trade_count
+                    })
+                else:
+                    # Нет сделок за 24 часа
+                    wallet_name = WALLET_NAMES.get(wallet, f"{wallet[:6]}...{wallet[-4:]}")
+                    wallet_results.append({
+                        'wallet': wallet,
+                        'wallet_name': wallet_name,
+                        'closed_pnl': 0.0,
+                        'net_pnl': 0.0,
+                        'trade_count': 0
+                    })
+
+            except sqlite3.Error as e:
+                debug_logger.error(f"Ошибка при получении данных для кошелька {wallet}: {e}")
+                continue
+
+        if wallet_results:
+            # Сортируем по Net PnL
+            wallet_results.sort(key=lambda x: x['net_pnl'], reverse=True)
+
+            report_message = format_hourly_ranking_report(wallet_results)
+
+            # Отправляем в Telegram
+            if send_telegram_message(report_message):
+                print(f"✅ Часовой рейтинговый отчет отправлен (кошельков: {len(wallet_results)})")
+                debug_logger.info(f"✅ Часовой рейтинговый отчет отправлен (кошельков: {len(wallet_results)})")
+            else:
+                print("❌ Ошибка при отправке часового рейтингового отчета")
+        else:
+            print("❌ Нет данных для рейтингового отчета")
+
+    except Exception as e:
+        error_msg = f"❌ Ошибка при создании часового рейтингового отчета: {e}"
+        print(error_msg)
+        debug_logger.error(error_msg)
+
+def format_hourly_ranking_report(wallet_results):
+    """Форматирует часовой рейтинговый отчет кошельков"""
+    now = datetime.now()
+
+    # Заголовок отчета
+    report_lines = [
+        f"🏆 <b>Рейтинг кошельков (24ч)</b>",
+        f"⏰ <i>{now.strftime('%Y-%m-%d %H:%M UTC')}</i>",
+        ""
+    ]
+
+    # Общая статистика
+    total_closed_pnl = sum(w['closed_pnl'] for w in wallet_results)
+    total_net_pnl = sum(w['net_pnl'] for w in wallet_results)
+    total_trades = sum(w['trade_count'] for w in wallet_results)
+    active_wallets = len([w for w in wallet_results if w['trade_count'] > 0])
+    profitable_wallets = len([w for w in wallet_results if w['net_pnl'] > 0])
+
+    total_closed_emoji = "🟢" if total_closed_pnl > 0 else "🔴" if total_closed_pnl < 0 else "⚪"
+    total_net_emoji = "🟢" if total_net_pnl > 0 else "🔴" if total_net_pnl < 0 else "⚪"
+
+    report_lines.extend([
+        f"📊 <b>Общая статистика:</b>",
+        f"📈 Closed PnL: <code>{total_closed_pnl:+.4f}</code> {total_closed_emoji}",
+        f"💹 Net PnL: <code>{total_net_pnl:+.4f}</code> {total_net_emoji}",
+        f"🔄 Всего сделок: {total_trades}",
+        f"💼 Активных кошельков: {active_wallets}/{len(wallet_results)}",
+        f"🟢 Прибыльных: {profitable_wallets} | 🔴 Убыточных: {len(wallet_results) - profitable_wallets}",
+        ""
+    ])
+
+    # ТОП-3 лучших кошелька
+    top_3 = wallet_results[:3]
+    if top_3:
+        report_lines.append("🥇 <b>ТОП-3 лучших кошелька:</b>")
+        for i, wallet in enumerate(top_3, 1):
+            emoji = ["🥇", "🥈", "🥉"][i-1]
+            pnl_emoji = "🟢" if wallet['net_pnl'] > 0 else "🔴" if wallet['net_pnl'] < 0 else "⚪"
+            report_lines.append(
+                f"{emoji} <code>{wallet['wallet_name']}</code>: "
+                f"<code>{wallet['net_pnl']:+.4f}</code> {pnl_emoji} "
+                f"({wallet['trade_count']} сделок)"
+            )
+        report_lines.append("")
+
+    # ТОП-3 худших кошелька
+    bottom_3 = wallet_results[-3:][::-1]  # Берем последние 3 и разворачиваем
+    if bottom_3 and len(wallet_results) > 3:
+        report_lines.append("🔴 <b>ТОП-3 худших кошелька:</b>")
+        for wallet in bottom_3:
+            pnl_emoji = "🔴" if wallet['net_pnl'] < 0 else "🟢" if wallet['net_pnl'] > 0 else "⚪"
+            report_lines.append(
+                f"📉 <code>{wallet['wallet_name']}</code>: "
+                f"<code>{wallet['net_pnl']:+.4f}</code> {pnl_emoji} "
+                f"({wallet['trade_count']} сделок)"
+            )
+        report_lines.append("")
+
+    # Неактивные кошельки
+    inactive_wallets = [w for w in wallet_results if w['trade_count'] == 0]
+    if inactive_wallets:
+        report_lines.append(f"😴 <b>Неактивные кошельки (24ч):</b> {len(inactive_wallets)}")
+        if len(inactive_wallets) <= 5:
+            for wallet in inactive_wallets:
+                report_lines.append(f"⚪ <code>{wallet['wallet_name']}</code>")
+        else:
+            report_lines.append(f"⚪ {', '.join([w['wallet_name'] for w in inactive_wallets[:5]])}...")
+
+    return "\n".join(report_lines)
 
 def send_monitoring_start_notification():
     """Отправляет уведомление о запуске мониторинга с общей сводкой"""
@@ -1988,9 +2128,17 @@ def continuous_monitoring():
             if cycle_count % 3 == 1:
                 debug_wallet_data('0xe04e82b16a9a418d50d8f9c358987d2ee735bded')
             
+            # Часовые отчеты (каждые 12 циклов = 60 минут)
+            cycles_per_hour = int(60 / 5)  # 12 циклов по 5 минут = 60 минут
+            report_interval_cycles = int(REPORT_INTERVAL_HOURS * cycles_per_hour)
+
+            if cycle_count % report_interval_cycles == 0:
+                print(f"\n⏰ {REPORT_INTERVAL_HOURS} час(ов) прошло - отправка рейтингового отчета кошельков...")
+                send_hourly_wallet_ranking_report()
+
             # Часовой отчет по открытым позициям (каждые 12 циклов = 60 минут)
             if cycle_count % 12 == 0:
-                print(f"\n⏰ Час прошел - отправка отчета по открытым позициям...")
+                print(f"\n📊 Час прошел - отправка отчета по открытым позициям...")
                 send_hourly_positions_report()
             
             run_incremental_monitoring()
